@@ -1,0 +1,38 @@
+bridge:
+  id: docker-ros1-check
+  direction: bidirectional
+
+nats:
+  servers:
+    - nats://nats:4222
+  tls:
+    enabled: false
+    handshake_first: false
+    ca_file: null
+    server_name: null
+  auth:
+    mode: none
+    username: null
+    password_env: null
+    token_env: null
+    nkey_file: null
+    creds_file: null
+
+ros:
+  version: 1
+  qos:
+    reliability: reliable
+    durability: volatile
+    depth: 10
+
+topics:
+  mode: include
+  patterns:
+    - /chatter
+
+sync:
+  subject_prefix: ros
+  throttle_ms: 0
+  dedupe: true
+  heartbeat_ms: 0
+  loop_suppression_ms: 1000

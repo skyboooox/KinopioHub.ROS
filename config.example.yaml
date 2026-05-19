@@ -1,0 +1,36 @@
+bridge:
+  id: ubuntu22-ros-bridge
+  direction: bidirectional
+
+nats:
+  servers:
+    - tls://nats.example.invalid:14222
+  tls:
+    enabled: true
+    handshake_first: true
+    ca_file: null
+    server_name: null
+  auth:
+    mode: none
+    username: null
+    password_env: null
+    token_env: null
+    nkey_file: null
+    creds_file: null
+
+ros:
+  version: auto
+  qos:
+    reliability: reliable
+    durability: volatile
+    depth: 10
+
+topics:
+  mode: all
+
+sync:
+  subject_prefix: ros
+  throttle_ms: 100
+  dedupe: true
+  heartbeat_ms: 0
+  loop_suppression_ms: 1000

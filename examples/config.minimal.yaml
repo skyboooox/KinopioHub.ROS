@@ -1,0 +1,17 @@
+bridge:
+  id: example-minimal-bridge
+  direction: bidirectional
+
+nats:
+  auth:
+    mode: none
+    creds_file: null
+
+ros:
+  version: auto
+
+topics:
+  mode: all
+
+sync:
+  subject_prefix: ros
