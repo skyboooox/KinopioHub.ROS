@@ -1,4 +1,5 @@
 import logging
+import asyncio
 
 import pytest
 
@@ -80,6 +81,47 @@ topics:
 
     assert driver.published == [("/chatter", "first"), ("/chatter", "second")]
     assert list(driver.publishers) == ["/chatter"]
+
+
+def test_ros1_adapter_calls_service_with_ros1_type(tmp_path):
+    config = write_config(
+        tmp_path,
+        """
+ros:
+  version: 1
+topics:
+  mode: all
+""".strip()
+        + "\n",
+    )
+    driver = FakeRos1Driver(
+        distro="noetic",
+        services={
+            "/lane_navigation/go_from_to": {
+                "accepted": True,
+            }
+        },
+    )
+    adapter = Ros1Adapter(config, driver=driver)
+    adapter.start()
+
+    response = asyncio.run(
+        adapter.call_service(
+            "/lane_navigation/go_from_to",
+            "lane_navigation/srv/GoFromTo",
+            {"goal_node": "node2"},
+            30000,
+        )
+    )
+
+    assert response == {"accepted": True}
+    assert driver.service_calls == [
+        (
+            "/lane_navigation/go_from_to",
+            "lane_navigation/GoFromTo",
+            {"goal_node": "node2"},
+        )
+    ]
 
 
 def test_ros1_adapter_rejects_explicit_ros2_config(tmp_path):

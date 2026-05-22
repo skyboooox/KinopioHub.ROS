@@ -1,5 +1,6 @@
 """ROS 2 topic adapter for the bridge runtime."""
 
+import asyncio
 import importlib
 import logging
 import os
@@ -8,10 +9,14 @@ import time
 from dataclasses import dataclass
 
 from kinopio_hub_ros.atom.ros_names import sanitize_ros_node_name
+from kinopio_hub_ros.atom.service_tools import (
+    normalize_service_name,
+    normalize_service_type_for_ros2,
+)
 from kinopio_hub_ros.atom.topic_tools import matches_any_topic_pattern, normalize_ros_topic
 from kinopio_hub_ros.business.envelope import ROS2_STRING_MESSAGE_TYPE
 from kinopio_hub_ros.business.message_text import ros2_text_to_message, ros_message_to_payload
-from kinopio_hub_ros.errors import AdapterError, RuntimeUnavailableError
+from kinopio_hub_ros.errors import AdapterError, RuntimeUnavailableError, ServiceCallError
 
 SUPPORTED_ROS2_DISTROS = ("foxy", "humble", "jazzy", "kilted", "rolling")
 
@@ -32,6 +37,14 @@ class Ros2PublisherHandle:
     message_type: str
 
 
+@dataclass(frozen=True)
+class Ros2ServiceClientHandle:
+    client: object
+    service_class: object
+    service_type: str
+    service_name: str
+
+
 class RclpyRos2Driver:
     def __init__(self, *, logger=None):
         self._logger = logger or logging.getLogger(__name__)
@@ -40,8 +53,10 @@ class RclpyRos2Driver:
         self._qos_profile = None
         self._distro = "unknown"
         self._get_message = None
+        self._get_service = None
         self._set_message_fields = None
         self._message_classes_by_type = {}
+        self._service_classes_by_type = {}
 
     @property
     def distro(self):
@@ -53,14 +68,18 @@ class RclpyRos2Driver:
             qos_module = importlib.import_module("rclpy.qos")
             utilities_module = importlib.import_module("rosidl_runtime_py.utilities")
             set_message_module = importlib.import_module("rosidl_runtime_py.set_message")
-        except ImportError as exc:
+            get_message = getattr(utilities_module, "get_message")
+            get_service = getattr(utilities_module, "get_service")
+            set_message_fields = getattr(set_message_module, "set_message_fields")
+        except (AttributeError, ImportError) as exc:
             raise RuntimeUnavailableError(
                 "ROS 2 runtime requires rclpy and rosidl_runtime_py to be installed in the current environment."
             ) from exc
 
         self._rclpy = rclpy
-        self._get_message = getattr(utilities_module, "get_message")
-        self._set_message_fields = getattr(set_message_module, "set_message_fields")
+        self._get_message = get_message
+        self._get_service = get_service
+        self._set_message_fields = set_message_fields
         self._qos_profile = self._build_qos_profile(qos_module, qos_config)
         self._distro = (os.getenv("ROS_DISTRO") or "unknown").strip().lower() or "unknown"
 
@@ -135,8 +154,50 @@ class RclpyRos2Driver:
             ) from exc
         publisher.publisher.publish(message)
 
+    def create_service_client(self, service_name, service_type):
+        node = self._require_node()
+        service_class = self._service_class(service_type)
+        return Ros2ServiceClientHandle(
+            client=node.create_client(service_class, service_name),
+            service_class=service_class,
+            service_type=service_type,
+            service_name=service_name,
+        )
+
+    def service_client_ready(self, client):
+        return client.client.service_is_ready()
+
+    def call_service_async(self, client, data):
+        request = client.service_class.Request()
+        try:
+            self._set_message_fields(request, data)
+        except Exception as exc:
+            raise ServiceCallError(
+                "Failed to encode ROS 2 service request for {0} as {1}".format(
+                    client.service_name,
+                    client.service_type,
+                ),
+                code="invalid_request",
+            ) from exc
+        return client.client.call_async(request)
+
+    def service_call_done(self, future):
+        return future.done()
+
+    def service_call_result(self, client, future):
+        response = future.result()
+        return ros_message_to_payload(response, client.service_type).json_value or {}
+
+    def remove_pending_service_request(self, client, future):
+        remove_pending_request = getattr(client.client, "remove_pending_request", None)
+        if callable(remove_pending_request):
+            remove_pending_request(future)
+
     def load_message_type(self, message_type):
         return self._message_class(message_type)
+
+    def load_service_type(self, service_type):
+        return self._service_class(service_type)
 
     def spin_once(self, *, timeout_sec):
         node = self._require_node()
@@ -159,6 +220,19 @@ class RclpyRos2Driver:
             ) from exc
         self._message_classes_by_type[message_type] = message_class
         return message_class
+
+    def _service_class(self, service_type):
+        service_class = self._service_classes_by_type.get(service_type)
+        if service_class is not None:
+            return service_class
+        try:
+            service_class = self._get_service(service_type)
+        except Exception as exc:
+            raise AdapterError(
+                "Unable to load ROS 2 service type {0}".format(service_type)
+            ) from exc
+        self._service_classes_by_type[service_type] = service_class
+        return service_class
 
     def _handle_subscription_message(self, topic, message_type, callback, message):
         try:
@@ -209,6 +283,7 @@ class Ros2Adapter:
         self._started = False
         self._subscriptions_by_topic = {}
         self._publishers_by_topic = {}
+        self._service_clients_by_name_type = {}
         self._message_types_by_topic = {}
         self._selected_topics = ()
         self._logged_unloadable_topics = set()
@@ -253,6 +328,7 @@ class Ros2Adapter:
         self._driver.shutdown()
         self._subscriptions_by_topic.clear()
         self._publishers_by_topic.clear()
+        self._service_clients_by_name_type.clear()
         self._message_types_by_topic.clear()
         self._selected_topics = ()
         self._started = False
@@ -328,6 +404,24 @@ class Ros2Adapter:
             publisher = self._ensure_text_publisher(normalized_topic, message_type)
         self._driver.publish_text(publisher, text)
 
+    async def call_service(self, name, service_type, data, timeout_ms):
+        self._require_started()
+        service_name = normalize_service_name(name)
+        normalized_type = normalize_service_type_for_ros2(service_type)
+        client = self._ensure_service_client(service_name, normalized_type)
+        timeout_sec = timeout_ms / 1000.0
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_sec
+
+        await self._wait_for_service_ready(client, deadline=deadline)
+
+        future = self._driver.call_service_async(client, data)
+        return await self._wait_for_service_result(
+            client,
+            future,
+            deadline=deadline,
+        )
+
     def topic_allowed(self, topic):
         normalized_topic = normalize_ros_topic(topic)
         mode = self._config.topics.mode
@@ -366,6 +460,52 @@ class Ros2Adapter:
                 self.distro,
             )
         return publisher
+
+    def _ensure_service_client(self, service_name, service_type):
+        client_key = (service_name, service_type)
+        client = self._service_clients_by_name_type.get(client_key)
+        if client is None:
+            self._driver.load_service_type(service_type)
+            client = self._driver.create_service_client(service_name, service_type)
+            self._service_clients_by_name_type[client_key] = client
+            self._logger.info(
+                "Prepared ROS 2 service client for %s type=%s (distro=%s)",
+                service_name,
+                service_type,
+                self.distro,
+            )
+        return client
+
+    async def _wait_for_service_ready(self, client, *, deadline):
+        loop = asyncio.get_running_loop()
+        while not self._driver.service_client_ready(client):
+            if loop.time() >= deadline:
+                raise ServiceCallError(
+                    "ROS 2 service is not available: {0}".format(client.service_name),
+                    code="service_unavailable",
+                )
+            await asyncio.sleep(0.01)
+
+    async def _wait_for_service_result(self, client, future, *, deadline):
+        loop = asyncio.get_running_loop()
+        while not self._driver.service_call_done(future):
+            if loop.time() >= deadline:
+                self._driver.remove_pending_service_request(client, future)
+                raise ServiceCallError(
+                    "ROS 2 service call timed out: {0}".format(client.service_name),
+                    code="service_timeout",
+                )
+            await asyncio.sleep(0.01)
+
+        try:
+            return self._driver.service_call_result(client, future)
+        except ServiceCallError:
+            raise
+        except Exception as exc:
+            raise ServiceCallError(
+                "ROS 2 service call failed: {0}".format(client.service_name),
+                code="service_error",
+            ) from exc
 
     def _select_message_type(self, topic, message_types):
         candidates = tuple(message_type for message_type in message_types if message_type)

@@ -12,6 +12,8 @@ from kinopio_hub_ros.atom.validation import (
     ensure_optional_string,
     ensure_string,
     normalize_ros_version,
+    validate_service_name,
+    validate_service_type,
     validate_subject_prefix,
     validate_topic_pattern,
 )
@@ -27,6 +29,8 @@ VALID_AUTH_MODES = ("none", "username_password", "token", "nkey", "creds")
 VALID_TOPIC_MODES = ("include", "exclude", "all")
 VALID_QOS_RELIABILITY = ("reliable", "best_effort")
 VALID_QOS_DURABILITY = ("volatile", "transient_local")
+DEFAULT_SERVICE_SUBJECT_PREFIX = "ros_services"
+DEFAULT_SERVICE_TIMEOUT_MS = 30000
 
 
 @dataclass(frozen=True)
@@ -130,6 +134,32 @@ class TopicSelectionConfig:
 
 
 @dataclass(frozen=True)
+class ServiceCallConfig:
+    name: str
+    service_type: str
+    timeout_ms: int
+
+    def to_dict(self):
+        return {
+            "name": self.name,
+            "type": self.service_type,
+            "timeout_ms": self.timeout_ms,
+        }
+
+
+@dataclass(frozen=True)
+class ServicesConfig:
+    subject_prefix: str
+    calls: tuple
+
+    def to_dict(self):
+        return {
+            "subject_prefix": self.subject_prefix,
+            "calls": [call.to_dict() for call in self.calls],
+        }
+
+
+@dataclass(frozen=True)
 class SyncConfig:
     subject_prefix: str
     throttle_ms: int
@@ -153,6 +183,7 @@ class AppConfig:
     nats: NatsConfig
     ros: RosConfig
     topics: TopicSelectionConfig
+    services: ServicesConfig
     sync: SyncConfig
 
     def to_public_dict(self):
@@ -161,19 +192,23 @@ class AppConfig:
             "nats": self.nats.to_dict(),
             "ros": self.ros.to_dict(),
             "topics": self.topics.to_dict(),
+            "services": self.services.to_dict(),
             "sync": self.sync.to_dict(),
         }
 
 
 def load_config(config_path):
     document = load_yaml_document(Path(config_path))
-    return AppConfig(
+    config = AppConfig(
         bridge=_parse_bridge(document.get("bridge")),
         nats=_parse_nats(document.get("nats")),
         ros=_parse_ros(document.get("ros")),
         topics=_parse_topics(document.get("topics")),
+        services=_parse_services(document.get("services")),
         sync=_parse_sync(document.get("sync")),
     )
+    _validate_app_config(config)
+    return config
 
 
 def _parse_bridge(value):
@@ -288,6 +323,45 @@ def _parse_topics(value):
     return TopicSelectionConfig(mode=mode, patterns=patterns)
 
 
+def _parse_services(value):
+    data = ensure_mapping(value, "services")
+    calls_value = data.get("calls", [])
+    if calls_value is None:
+        calls_value = []
+    if not isinstance(calls_value, list):
+        raise ConfigError("must be a list", field="services.calls")
+
+    calls = []
+    for index, item in enumerate(calls_value):
+        field = "services.calls[{0}]".format(index)
+        call = ensure_mapping(item, field)
+        service_name = validate_service_name(call.get("name"), "{0}.name".format(field))
+        if any(existing.name == service_name for existing in calls):
+            raise ConfigError("duplicates an earlier service call", field="{0}.name".format(field))
+        calls.append(
+            ServiceCallConfig(
+                name=service_name,
+                service_type=validate_service_type(call.get("type"), "{0}.type".format(field)),
+                timeout_ms=ensure_int(
+                    call.get("timeout_ms", DEFAULT_SERVICE_TIMEOUT_MS),
+                    "{0}.timeout_ms".format(field),
+                    minimum=1,
+                ),
+            )
+        )
+
+    return ServicesConfig(
+        subject_prefix=validate_subject_prefix(
+            ensure_string(
+                data.get("subject_prefix", DEFAULT_SERVICE_SUBJECT_PREFIX),
+                "services.subject_prefix",
+            ),
+            "services.subject_prefix",
+        ),
+        calls=tuple(calls),
+    )
+
+
 def _parse_sync(value):
     data = ensure_mapping(value, "sync")
     return SyncConfig(
@@ -304,6 +378,18 @@ def _parse_sync(value):
             minimum=0,
         ),
     )
+
+
+def _validate_app_config(config):
+    if not config.services.calls:
+        return
+    sync_prefix = config.sync.subject_prefix
+    service_prefix = config.services.subject_prefix
+    if service_prefix == sync_prefix or service_prefix.startswith(sync_prefix + "."):
+        raise ConfigError(
+            "must not match or be nested under sync.subject_prefix",
+            field="services.subject_prefix",
+        )
 
 
 def _require_field(value, field):

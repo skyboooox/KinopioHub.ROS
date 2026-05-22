@@ -27,6 +27,7 @@ async def run_preflight_checks(
             "bridge": config.bridge.to_dict(),
             "ros": config.ros.to_dict(),
             "topics": config.topics.to_dict(),
+            "services": config.services.to_dict(),
             "sync": config.sync.to_dict(),
             "nats": {
                 "servers": list(config.nats.servers),

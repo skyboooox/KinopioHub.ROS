@@ -28,6 +28,13 @@ ros:
 topics:
   mode: all
 
+services:
+  subject_prefix: ros_services
+  calls:
+    - name: /lane_navigation/go_from_to
+      type: lane_navigation/srv/GoFromTo
+      timeout_ms: 30000
+
 sync:
   subject_prefix: ros
   throttle_ms: 100

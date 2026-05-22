@@ -1,7 +1,7 @@
 # KinopioHub.ROS
 
-KinopioHub.ROS is a bidirectional ROS topic bridge for KinopioHub-compatible KinopioHub subjects.
-It discovers ROS 1 or ROS 2 topics, serializes ROS messages into JSON envelopes, publishes them to KinopioHub, and accepts matching KinopioHub envelopes for ROS writeback.
+KinopioHub.ROS is a bidirectional ROS topic bridge plus an explicit ROS service request-reply bridge for KinopioHub-compatible NATS subjects.
+It discovers ROS 1 or ROS 2 topics, serializes ROS messages into JSON envelopes, publishes them to KinopioHub, accepts matching KinopioHub envelopes for ROS writeback, and exposes configured ROS services over NATS request-reply.
 
 中文说明见 [README_CN.md](./README_CN.md).
 
@@ -14,9 +14,10 @@ It discovers ROS 1 or ROS 2 topics, serializes ROS messages into JSON envelopes,
 - ROS 2 adapter: Foxy, Humble, Jazzy, Kilted; Rolling is best-effort
 - ROS 1 adapter: Noetic
 - Default topic mode: `all`, meaning every discoverable topic whose message type can be imported
+- Service calls: explicit allowlist only; no service is exposed unless configured
 - Runtime config: copy `config.example.yaml` to an untracked `config.yaml`
 
-The bridge handles regular ROS topics, not services or actions.
+Actions are out of scope.
 
 ## Quick Start
 
@@ -74,6 +75,13 @@ ros:
 topics:
   mode: all
 
+services:
+  subject_prefix: ros_services
+  calls:
+    - name: /lane_navigation/go_from_to
+      type: lane_navigation/srv/GoFromTo
+      timeout_ms: 30000
+
 sync:
   subject_prefix: ros
   throttle_ms: 100
@@ -83,6 +91,8 @@ sync:
 ```
 
 Topic selection supports `all`, `include`, and `exclude`. `include` and `exclude` require ROS topic patterns such as `/chatter`, `/robot/*/state`, or `/robot/**/text`.
+
+`services.calls` defaults to empty. Each configured service is exposed as a NATS request-reply responder. Service types may use ROS 2 style `pkg/srv/Name`; ROS 1 runtime calls normalize that to `pkg/Name`.
 
 Supported auth modes are `none`, `username_password`, `token`, `nkey`, and `creds`. Secret values should be supplied through environment variables or untracked private files.
 
@@ -98,6 +108,14 @@ ROS topics map to KinopioHub subjects by stripping the leading slash, replacing 
 Structured messages use `kinopio.ros.message.v1`; `data` is the ROS message as a JSON object. `std_msgs/String` and `std_msgs/msg/String` keep the legacy `kinopio.ros.text.v1` envelope for SDK compatibility. The decoder still accepts legacy text envelopes for writeback.
 
 Every envelope carries `topic`, `subject`, ROS version/distro/type, timestamp, `meta.bridgeId`, and `meta.sequence`. `bridgeId` plus recent-writeback tracking prevents infinite loops.
+
+Configured ROS services map to `services.subject_prefix` with the same slash-to-dot rule:
+
+```text
+/lane_navigation/go_from_to -> ros_services.lane_navigation.go_from_to
+```
+
+Service request-reply uses `kinopio.ros.service.v1`. A NATS client sends a request to the mapped subject with `direction: nats_to_ros`, `service`, `subject`, `ros.version`, `ros.type`, `data`, and `meta`; the bridge replies to the NATS reply subject with `direction: ros_to_nats`, `ok: true` and response `data`, or `ok: false` plus `error.code`/`error.message`.
 
 ## Verification
 
@@ -145,5 +163,6 @@ python scripts/js_sdk_check.py
 - Look for `Connected NATS adapter` to confirm the selected server.
 - `Ignoring invalid NATS envelope` means the payload does not match the envelope contract.
 - `Ignoring NATS envelope with mismatched subject/topic` means the subject does not match the envelope topic mapping.
+- Service request errors return `kinopio.ros.service.v1` replies with `ok: false`.
 
 This repository provides commands and verification scripts only. It does not install a systemd service, modify firewalls, write certificates, or change ROS environment files.

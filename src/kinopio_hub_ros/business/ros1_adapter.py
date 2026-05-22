@@ -1,5 +1,6 @@
 """ROS 1 topic adapter for the bridge runtime."""
 
+import asyncio
 import importlib
 import logging
 import os
@@ -8,10 +9,14 @@ import time
 from dataclasses import dataclass
 
 from kinopio_hub_ros.atom.ros_names import sanitize_ros_node_name
+from kinopio_hub_ros.atom.service_tools import (
+    normalize_service_name,
+    normalize_service_type_for_ros1,
+)
 from kinopio_hub_ros.atom.topic_tools import matches_any_topic_pattern, normalize_ros_topic
 from kinopio_hub_ros.business.envelope import ROS1_STRING_MESSAGE_TYPE
 from kinopio_hub_ros.business.message_text import ros1_text_to_message, ros_message_to_payload
-from kinopio_hub_ros.errors import AdapterError, RuntimeUnavailableError
+from kinopio_hub_ros.errors import AdapterError, RuntimeUnavailableError, ServiceCallError
 
 SUPPORTED_ROS1_DISTROS = ("noetic",)
 
@@ -47,6 +52,7 @@ class RospyRos1Driver:
         self._fill_message_args = None
         self._fill_keys = {}
         self._message_classes_by_type = {}
+        self._service_classes_by_type = {}
         self._publisher_queue_size = 10
         self._publisher_latch = False
         self._distro = "unknown"
@@ -144,8 +150,46 @@ class RospyRos1Driver:
             ) from exc
         publisher.publisher.publish(message)
 
+    def call_service(self, service_name, service_type, data, timeout_sec):
+        service_class = self._service_class(service_type)
+        proxy = self._rospy.ServiceProxy(service_name, service_class, persistent=False)
+        try:
+            proxy.wait_for_service(timeout=timeout_sec)
+        except Exception as exc:
+            raise ServiceCallError(
+                "ROS 1 service is not available: {0}".format(service_name),
+                code="service_unavailable",
+            ) from exc
+
+        request = service_class._request_class()
+        try:
+            self._fill_message_args(request, [data], keys=self._fill_keys)
+        except Exception as exc:
+            raise ServiceCallError(
+                "Failed to encode ROS 1 service request for {0} as {1}".format(
+                    service_name,
+                    service_type,
+                ),
+                code="invalid_request",
+            ) from exc
+
+        try:
+            response = proxy.call(request)
+        except ServiceCallError:
+            raise
+        except Exception as exc:
+            raise ServiceCallError(
+                "ROS 1 service call failed: {0}".format(service_name),
+                code="service_error",
+            ) from exc
+
+        return ros_message_to_payload(response, service_type).json_value or {}
+
     def load_message_type(self, message_type):
         return self._message_class(message_type)
+
+    def load_service_type(self, service_type):
+        return self._service_class(service_type)
 
     def spin_once(self, *, timeout_sec):
         if timeout_sec > 0:
@@ -160,6 +204,16 @@ class RospyRos1Driver:
             raise AdapterError("Unable to load ROS 1 message type {0}".format(message_type))
         self._message_classes_by_type[message_type] = message_class
         return message_class
+
+    def _service_class(self, service_type):
+        service_class = self._service_classes_by_type.get(service_type)
+        if service_class is not None:
+            return service_class
+        service_class = self._message_module.get_service_class(service_type)
+        if service_class is None:
+            raise AdapterError("Unable to load ROS 1 service type {0}".format(service_type))
+        self._service_classes_by_type[service_type] = service_class
+        return service_class
 
     def _handle_subscription_message(self, topic, message_type, callback, message):
         try:
@@ -332,6 +386,31 @@ class Ros1Adapter:
         if publisher is None:
             publisher = self._ensure_text_publisher(normalized_topic, message_type)
         self._driver.publish_text(publisher, text)
+
+    async def call_service(self, name, service_type, data, timeout_ms):
+        self._require_started()
+        service_name = normalize_service_name(name)
+        normalized_type = normalize_service_type_for_ros1(service_type)
+        self._driver.load_service_type(normalized_type)
+
+        loop = asyncio.get_running_loop()
+        try:
+            return await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    self._driver.call_service,
+                    service_name,
+                    normalized_type,
+                    data,
+                    timeout_ms / 1000.0,
+                ),
+                timeout=timeout_ms / 1000.0,
+            )
+        except asyncio.TimeoutError as exc:
+            raise ServiceCallError(
+                "ROS 1 service call timed out: {0}".format(service_name),
+                code="service_timeout",
+            ) from exc
 
     def topic_allowed(self, topic):
         normalized_topic = normalize_ros_topic(topic)

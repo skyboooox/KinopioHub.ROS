@@ -3,6 +3,10 @@
 import re
 
 from kinopio_hub_ros.atom.topic_tools import normalize_topic_pattern
+from kinopio_hub_ros.atom.service_tools import (
+    normalize_service_name,
+    normalize_service_type,
+)
 from kinopio_hub_ros.errors import ConfigError
 
 SUBJECT_PREFIX_PATTERN = re.compile(r"^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$")
@@ -73,6 +77,22 @@ def validate_topic_pattern(value, field):
     pattern = ensure_string(value, field)
     try:
         return normalize_topic_pattern(pattern)
+    except Exception as exc:
+        raise ConfigError(str(exc), field=field)
+
+
+def validate_service_name(value, field):
+    name = ensure_string(value, field)
+    try:
+        return normalize_service_name(name)
+    except Exception as exc:
+        raise ConfigError(str(exc), field=field)
+
+
+def validate_service_type(value, field):
+    service_type = ensure_string(value, field)
+    try:
+        return normalize_service_type(service_type)
     except Exception as exc:
         raise ConfigError(str(exc), field=field)
 

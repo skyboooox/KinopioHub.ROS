@@ -10,6 +10,12 @@ from kinopio_hub_ros.business.envelope import (
     decode_envelope,
     encode_envelope,
 )
+from kinopio_hub_ros.business.service_envelope import (
+    SERVICE_ENVELOPE_SCHEMA,
+    build_service_request_envelope,
+    decode_service_envelope,
+    encode_service_envelope,
+)
 from kinopio_hub_ros.business.nats_adapter import NatsMessage
 from kinopio_hub_ros.business.ros1_adapter import Ros1Adapter
 from kinopio_hub_ros.business.ros2_adapter import Ros2Adapter
@@ -33,6 +39,8 @@ class FakeNatsAdapter:
         self.published = []
         self.subscription_subject = None
         self.subscription_callback = None
+        self.subscription_subjects = []
+        self.subscription_callbacks = []
         self.subscription = FakeNatsSubscription()
         self.fail_connect = fail_connect
 
@@ -61,20 +69,99 @@ class FakeNatsAdapter:
     async def subscribe(self, subject, callback, *, queue=None, max_messages=None):
         self.subscription_subject = subject
         self.subscription_callback = callback
+        self.subscription_subjects.append(subject)
+        self.subscription_callbacks.append((subject, callback))
         return self.subscription
 
-    async def emit(self, *, subject, payload):
-        result = self.subscription_callback(
-            NatsMessage(subject=subject, data=payload, reply="", headers=None)
-        )
-        if inspect.isawaitable(result):
-            await result
+    async def emit(self, *, subject, payload, reply=""):
+        emitted = False
+        for subscription_subject, callback in self.subscription_callbacks:
+            if not subject_matches(subscription_subject, subject):
+                continue
+            emitted = True
+            result = callback(
+                NatsMessage(subject=subject, data=payload, reply=reply, headers=None)
+            )
+            if inspect.isawaitable(result):
+                await result
+        if not emitted and self.subscription_callback is not None:
+            result = self.subscription_callback(
+                NatsMessage(subject=subject, data=payload, reply=reply, headers=None)
+            )
+            if inspect.isawaitable(result):
+                await result
+
+
+def subject_matches(pattern, subject):
+    if pattern.endswith(".>"):
+        return subject.startswith(pattern[:-1])
+    return pattern == subject
 
 
 def write_config(tmp_path, body):
     path = tmp_path / "config.yaml"
     path.write_text(body, encoding="utf-8")
     return load_config(path)
+
+
+async def tick_until_idle(runtime, count=3):
+    for _ in range(count):
+        await runtime.tick(spin_timeout_sec=0.0)
+        await asyncio.sleep(0)
+
+
+SERVICE_NAME = "/lane_navigation/go_from_to"
+SERVICE_TYPE = "lane_navigation/srv/GoFromTo"
+SERVICE_SUBJECT = "ros_services.lane_navigation.go_from_to"
+
+
+def service_config(tmp_path, *, ros_version=2, timeout_ms=30000, direction="bidirectional"):
+    direction_block = "bridge:\n  direction: {0}\n".format(direction) if direction else ""
+    return write_config(
+        tmp_path,
+        (
+            direction_block
+            + """
+ros:
+  version: {ros_version}
+topics:
+  mode: all
+services:
+  calls:
+    - name: {service_name}
+      type: {service_type}
+      timeout_ms: {timeout_ms}
+""".format(
+                ros_version=ros_version,
+                service_name=SERVICE_NAME,
+                service_type=SERVICE_TYPE,
+                timeout_ms=timeout_ms,
+            )
+        ).strip()
+        + "\n",
+    )
+
+
+def service_request(data, *, ros_version=2, service=SERVICE_NAME, subject=SERVICE_SUBJECT):
+    return encode_service_envelope(
+        build_service_request_envelope(
+            service=service,
+            subject=subject,
+            data=data,
+            bridge_id="sdk",
+            sequence=1,
+            ros_version=ros_version,
+            ros_service_type=SERVICE_TYPE,
+        )
+    )
+
+
+async def wait_for_nats_publish(nats_adapter, *, count=1, timeout_sec=0.1):
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_sec
+    while len(nats_adapter.published) < count and loop.time() < deadline:
+        await asyncio.sleep(0.001)
+    assert len(nats_adapter.published) >= count
 
 
 def test_bridge_forwards_ros_text_to_nats(tmp_path):
@@ -499,3 +586,229 @@ topics:
     assert decode_envelope(nats_adapter.published[0]["payload"]).ros.version == 1
     assert decode_envelope(nats_adapter.published[0]["payload"]).ros.message_type == "std_msgs/String"
     assert ros_driver.published == [("/chatter", "writeback noetic")]
+
+
+def test_bridge_replies_to_ros2_service_request(tmp_path):
+    config = service_config(tmp_path, ros_version=2)
+    ros_driver = FakeRos2Driver(
+        services={
+            SERVICE_NAME: {
+                "accepted": True,
+                "message": "started",
+            }
+        }
+    )
+    nats_adapter = FakeNatsAdapter()
+    runtime = BridgeRuntime(
+        config,
+        nats_adapter=nats_adapter,
+        ros_adapter=Ros2Adapter(config, driver=ros_driver),
+    )
+
+    async def run():
+        await runtime.start()
+        await nats_adapter.emit(
+            subject=SERVICE_SUBJECT,
+            payload=service_request(
+                {
+                    "start_node": "",
+                    "goal_node": "node2",
+                    "loop": False,
+                    "repeat_count": 1,
+                }
+            ),
+            reply="_INBOX.1",
+        )
+        await wait_for_nats_publish(nats_adapter)
+        await runtime.close()
+
+    asyncio.run(run())
+
+    assert nats_adapter.subscription_subjects == ["ros.>", SERVICE_SUBJECT]
+    assert ros_driver.service_calls == [
+        (
+            SERVICE_NAME,
+            SERVICE_TYPE,
+            {
+                "start_node": "",
+                "goal_node": "node2",
+                "loop": False,
+                "repeat_count": 1,
+            },
+        )
+    ]
+    assert len(nats_adapter.published) == 1
+    published = nats_adapter.published[0]
+    response = decode_service_envelope(published["payload"])
+    raw_payload = json.loads(published["payload"].decode("utf-8"))
+    assert published["subject"] == "_INBOX.1"
+    assert raw_payload["schema"] == SERVICE_ENVELOPE_SCHEMA
+    assert response.direction == "ros_to_nats"
+    assert response.ok is True
+    assert response.data == {"accepted": True, "message": "started"}
+    assert response.service == SERVICE_NAME
+    assert response.ros.version == 2
+    assert response.ros.service_type == SERVICE_TYPE
+
+
+def test_bridge_replies_to_ros1_service_request_with_ros1_type(tmp_path):
+    config = service_config(tmp_path, ros_version=1)
+    ros_driver = FakeRos1Driver(
+        services={
+            SERVICE_NAME: {
+                "accepted": True,
+            }
+        }
+    )
+    nats_adapter = FakeNatsAdapter()
+    runtime = BridgeRuntime(
+        config,
+        nats_adapter=nats_adapter,
+        ros_adapter=Ros1Adapter(config, driver=ros_driver),
+    )
+
+    async def run():
+        await runtime.start()
+        await nats_adapter.emit(
+            subject=SERVICE_SUBJECT,
+            payload=service_request({"goal_node": "node2"}, ros_version=1),
+            reply="_INBOX.ros1",
+        )
+        await wait_for_nats_publish(nats_adapter)
+        await runtime.close()
+
+    asyncio.run(run())
+
+    assert ros_driver.service_calls == [
+        (
+            SERVICE_NAME,
+            "lane_navigation/GoFromTo",
+            {"goal_node": "node2"},
+        )
+    ]
+    response = decode_service_envelope(nats_adapter.published[0]["payload"])
+    assert nats_adapter.published[0]["subject"] == "_INBOX.ros1"
+    assert response.ok is True
+    assert response.data == {"accepted": True}
+    assert response.ros.version == 1
+
+
+def test_bridge_rejects_mismatched_service_request(tmp_path):
+    config = service_config(tmp_path, ros_version=2)
+    ros_driver = FakeRos2Driver()
+    nats_adapter = FakeNatsAdapter()
+    runtime = BridgeRuntime(
+        config,
+        nats_adapter=nats_adapter,
+        ros_adapter=Ros2Adapter(config, driver=ros_driver),
+    )
+
+    async def run():
+        await runtime.start()
+        await nats_adapter.emit(
+            subject=SERVICE_SUBJECT,
+            payload=service_request({"goal_node": "node2"}, service="/lane_navigation/other"),
+            reply="_INBOX.bad",
+        )
+        await wait_for_nats_publish(nats_adapter)
+        await runtime.close()
+
+    asyncio.run(run())
+
+    response = decode_service_envelope(nats_adapter.published[0]["payload"])
+    assert ros_driver.service_calls == []
+    assert response.ok is False
+    assert response.error.code == "invalid_request"
+
+
+def test_bridge_service_unavailable_and_timeout_return_errors(tmp_path):
+    unavailable_config = service_config(tmp_path, ros_version=2, timeout_ms=1)
+
+    async def run_case(config, driver, inbox):
+        nats_adapter = FakeNatsAdapter()
+        runtime = BridgeRuntime(
+            config,
+            nats_adapter=nats_adapter,
+            ros_adapter=Ros2Adapter(config, driver=driver),
+        )
+        await runtime.start()
+        await nats_adapter.emit(
+            subject=SERVICE_SUBJECT,
+            payload=service_request({"goal_node": "node2"}),
+            reply=inbox,
+        )
+        await wait_for_nats_publish(nats_adapter, timeout_sec=0.05)
+        response = decode_service_envelope(nats_adapter.published[0]["payload"])
+        await runtime.close()
+        return response
+
+    unavailable = asyncio.run(
+        run_case(
+            unavailable_config,
+            FakeRos2Driver(service_ready={SERVICE_NAME: False}),
+            "_INBOX.unavailable",
+        )
+    )
+    timed_out = asyncio.run(
+        run_case(
+            unavailable_config,
+            FakeRos2Driver(services={SERVICE_NAME: "__pending__"}),
+            "_INBOX.timeout",
+        )
+    )
+
+    assert unavailable.ok is False
+    assert unavailable.error.code == "service_unavailable"
+    assert timed_out.ok is False
+    assert timed_out.error.code == "service_timeout"
+
+
+def test_bridge_invalid_service_payload_returns_error(tmp_path):
+    config = service_config(tmp_path, ros_version=2)
+    nats_adapter = FakeNatsAdapter()
+    runtime = BridgeRuntime(
+        config,
+        nats_adapter=nats_adapter,
+        ros_adapter=Ros2Adapter(config, driver=FakeRos2Driver()),
+    )
+
+    async def run():
+        await runtime.start()
+        request = json.dumps(
+            {
+                "schema": "kinopio.ros.service.v1",
+                "direction": "nats_to_ros",
+                "service": SERVICE_NAME,
+                "subject": SERVICE_SUBJECT,
+                "ros": {"version": 2, "type": SERVICE_TYPE},
+                "data": ["not", "a", "mapping"],
+                "meta": {"bridgeId": "sdk", "sequence": 1},
+            }
+        ).encode("utf-8")
+        await nats_adapter.emit(subject=SERVICE_SUBJECT, payload=request, reply="_INBOX.invalid")
+        await wait_for_nats_publish(nats_adapter)
+        await runtime.close()
+
+    asyncio.run(run())
+
+    response = decode_service_envelope(nats_adapter.published[0]["payload"])
+    assert response.ok is False
+    assert response.error.code == "invalid_request"
+
+
+def test_bridge_ros_to_nats_direction_does_not_expose_service_responder(tmp_path):
+    config = service_config(tmp_path, ros_version=2, direction="ros_to_nats")
+    nats_adapter = FakeNatsAdapter()
+    runtime = BridgeRuntime(
+        config,
+        nats_adapter=nats_adapter,
+        ros_adapter=Ros2Adapter(config, driver=FakeRos2Driver()),
+    )
+
+    async def run():
+        await runtime.start()
+        await runtime.close()
+
+    asyncio.run(run())
+
+    assert nats_adapter.subscription_subjects == []

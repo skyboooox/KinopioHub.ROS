@@ -116,6 +116,14 @@ def _ensure_file_contains(project_name, env, path, expected, *, timeout_sec=20):
     raise CheckFailure(f"Timed out waiting for {path} to contain {expected!r}")
 
 
+def _ensure_service_reply_ok(reply):
+    if not reply.get("ok"):
+        raise CheckFailure(f"Service request failed: {reply}")
+    data = reply.get("data") or {}
+    if data.get("success") is not True:
+        raise CheckFailure(f"Service response did not contain success=true: {reply}")
+
+
 def _ensure_bridge_ready(project_name, env, *, timeout_sec=20):
     deadline = time.time() + timeout_sec
     while time.time() < deadline:
@@ -269,6 +277,57 @@ PY""",
     )
 
 
+def _request_set_bool_via_nats(project_name, env, *, ros_version):
+    result = _compose_exec(
+        project_name,
+        env,
+        "bash",
+        "-lc",
+        f"""python - <<'PY'
+import asyncio
+import json
+
+from nats.aio.client import Client
+from kinopio_hub_ros.business.service_envelope import (
+    build_service_request_envelope,
+    decode_service_envelope,
+    encode_service_envelope,
+)
+
+SUBJECT = "ros_services.docker_matrix.set_bool"
+
+async def main():
+    client = Client()
+    await client.connect(servers=["nats://nats:4222"])
+    request = build_service_request_envelope(
+        service="/docker_matrix/set_bool",
+        subject=SUBJECT,
+        data={{"data": True}},
+        bridge_id="docker-check-service-client",
+        sequence=1,
+        ros_version={ros_version},
+        ros_service_type="std_srvs/srv/SetBool",
+    )
+    message = await client.request(
+        SUBJECT,
+        encode_service_envelope(request),
+        timeout=20,
+    )
+    response = decode_service_envelope(message.data)
+    print(json.dumps({{
+        "ok": response.ok,
+        "data": response.data,
+        "error": response.error.to_dict() if response.error else None,
+    }}, ensure_ascii=False))
+    await client.close()
+
+asyncio.run(main())
+PY""",
+        capture_output=True,
+    )
+    return json.loads(result.stdout)
+
+
 def _run_ros2_publish(project_name, env, *, text):
     _compose_exec(
         project_name,
@@ -290,6 +349,32 @@ while time.time() < deadline:
     publisher.publish(message)
     rclpy.spin_once(node, timeout_sec=0.1)
     time.sleep(0.4)
+node.destroy_node()
+rclpy.shutdown()
+PY""",
+    )
+
+
+def _start_ros2_service_server(project_name, env):
+    _compose_exec_detached(
+        project_name,
+        env,
+        "bash",
+        "-lc",
+        f"""source /opt/ros/${{ROS_DISTRO}}/setup.bash && python - <<'PY'
+import rclpy
+from std_srvs.srv import SetBool
+
+rclpy.init(args=None)
+node = rclpy.create_node("docker_matrix_ros2_set_bool_server")
+
+def callback(request, response):
+    response.success = bool(request.data)
+    response.message = "ros2 {env['ROS_DISTRO']} set_bool " + str(bool(request.data))
+    return response
+
+node.create_service(SetBool, "/docker_matrix/set_bool", callback)
+rclpy.spin(node)
 node.destroy_node()
 rclpy.shutdown()
 PY""",
@@ -351,6 +436,29 @@ deadline = time.time() + 4
 while time.time() < deadline:
     publisher.publish(String(data={text!r}))
     rospy.sleep(0.4)
+PY""",
+    )
+
+
+def _start_ros1_service_server(project_name, env):
+    _compose_exec_detached(
+        project_name,
+        env,
+        "bash",
+        "-lc",
+        """source /opt/ros/${ROS_DISTRO}/setup.bash && python - <<'PY'
+import rospy
+from std_srvs.srv import SetBool, SetBoolResponse
+
+def callback(request):
+    return SetBoolResponse(
+        success=bool(request.data),
+        message="ros1 noetic set_bool " + str(bool(request.data)),
+    )
+
+rospy.init_node("docker_matrix_ros1_set_bool_server", anonymous=False, disable_signals=True)
+rospy.Service("/docker_matrix/set_bool", SetBool, callback)
+rospy.spin()
 PY""",
     )
 
@@ -439,10 +547,18 @@ def _run_ros2_distro(distro):
             "/tmp/nats_to_ros.json",
             nats_to_ros_text,
         )
+        _start_ros2_service_server(project_name, env)
+        service_reply = _request_set_bool_via_nats(
+            project_name,
+            env,
+            ros_version=2,
+        )
+        _ensure_service_reply_ok(service_reply)
         return {
             "status": "passed",
             "ros_to_nats": json.loads(ros_to_nats),
             "nats_to_ros": json.loads(nats_to_ros),
+            "service_reply": service_reply,
         }
     finally:
         _cleanup_processes(project_name, env)
@@ -487,10 +603,18 @@ def _run_ros1_noetic():
             "/tmp/nats_to_ros1.json",
             nats_to_ros_text,
         )
+        _start_ros1_service_server(project_name, env)
+        service_reply = _request_set_bool_via_nats(
+            project_name,
+            env,
+            ros_version=1,
+        )
+        _ensure_service_reply_ok(service_reply)
         return {
             "status": "passed",
             "ros_to_nats": json.loads(ros_to_nats),
             "nats_to_ros": json.loads(nats_to_ros),
+            "service_reply": service_reply,
         }
     finally:
         _cleanup_processes(project_name, env)

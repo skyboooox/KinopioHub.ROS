@@ -24,3 +24,11 @@ class ProtocolError(KinopioHubRosError):
 
 class AdapterError(KinopioHubRosError):
     """Raised when an external adapter cannot be configured or used."""
+
+
+class ServiceCallError(AdapterError):
+    """Raised when a ROS service call cannot complete."""
+
+    def __init__(self, message, code="service_error"):
+        self.code = code
+        super().__init__(message)

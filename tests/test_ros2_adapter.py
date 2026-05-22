@@ -1,10 +1,11 @@
 import logging
+import asyncio
 
 import pytest
 
 from kinopio_hub_ros.business.configuration import load_config
 from kinopio_hub_ros.business.ros2_adapter import Ros2Adapter
-from kinopio_hub_ros.errors import AdapterError, RuntimeUnavailableError
+from kinopio_hub_ros.errors import AdapterError, RuntimeUnavailableError, ServiceCallError
 from tests.fakes import FakeRos2Driver
 
 
@@ -106,6 +107,76 @@ topics:
 
     assert driver.published == [("/chatter", "first"), ("/chatter", "second")]
     assert list(driver.publishers) == ["/chatter"]
+
+
+def test_ros2_adapter_calls_service_with_ros2_type(tmp_path):
+    config = write_config(
+        tmp_path,
+        """
+ros:
+  version: 2
+topics:
+  mode: all
+""".strip()
+        + "\n",
+    )
+    driver = FakeRos2Driver(
+        services={
+            "/lane_navigation/go_from_to": {
+                "accepted": True,
+            }
+        }
+    )
+    adapter = Ros2Adapter(config, driver=driver)
+    adapter.start()
+
+    response = asyncio.run(
+        adapter.call_service(
+            "/lane_navigation/go_from_to",
+            "lane_navigation/GoFromTo",
+            {"goal_node": "node2"},
+            30000,
+        )
+    )
+
+    assert response == {"accepted": True}
+    assert driver.service_calls == [
+        (
+            "/lane_navigation/go_from_to",
+            "lane_navigation/srv/GoFromTo",
+            {"goal_node": "node2"},
+        )
+    ]
+
+
+def test_ros2_adapter_reports_unavailable_service(tmp_path):
+    config = write_config(
+        tmp_path,
+        """
+ros:
+  version: 2
+topics:
+  mode: all
+""".strip()
+        + "\n",
+    )
+    adapter = Ros2Adapter(
+        config,
+        driver=FakeRos2Driver(service_ready={"/lane_navigation/go_from_to": False}),
+    )
+    adapter.start()
+
+    with pytest.raises(ServiceCallError) as excinfo:
+        asyncio.run(
+            adapter.call_service(
+                "/lane_navigation/go_from_to",
+                "lane_navigation/srv/GoFromTo",
+                {"goal_node": "node2"},
+                1,
+            )
+        )
+
+    assert excinfo.value.code == "service_unavailable"
 
 
 def test_ros2_adapter_rejects_explicit_ros1_config(tmp_path):

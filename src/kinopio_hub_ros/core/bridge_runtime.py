@@ -19,6 +19,7 @@ from kinopio_hub_ros.business.message_text import (
 from kinopio_hub_ros.business.nats_adapter import NatsAdapter
 from kinopio_hub_ros.business.ros_adapter_factory import create_ros_adapter
 from kinopio_hub_ros.business.subject_mapping import topic_to_subject
+from kinopio_hub_ros.core.service_responder import ServiceResponder
 from kinopio_hub_ros.core.sync_policy import LatestStatePolicy
 from kinopio_hub_ros.errors import ProtocolError
 
@@ -58,6 +59,13 @@ class BridgeRuntime:
         self._discovery_interval_ms = 1000
         self._next_discovery_at_ms = 0
         self._nats_subscription = None
+        self._service_responder = ServiceResponder(
+            config,
+            ros_adapter=self._ros,
+            nats_adapter=self._nats,
+            next_sequence=self._take_sequence,
+            logger=self._logger,
+        )
         self._stop_event = asyncio.Event()
         self._selected_topics = None
 
@@ -100,13 +108,17 @@ class BridgeRuntime:
                     "Subscribed to NATS wildcard %s for writeback envelopes",
                     self._subject_wildcard(),
                 )
+                await self._service_responder.start()
 
             self._refresh_ros_subscriptions()
             self._started = True
         except Exception:
+            await self._service_responder.close()
+            if self._nats_subscription is not None:
+                await self._nats_subscription.unsubscribe()
+                self._nats_subscription = None
             await self._nats.close()
             self._ros.close()
-            self._nats_subscription = None
             raise
 
     async def close(self):
@@ -114,6 +126,7 @@ class BridgeRuntime:
         if self._nats_subscription is not None:
             await self._nats_subscription.unsubscribe()
             self._nats_subscription = None
+        await self._service_responder.close()
         await self._nats.close()
         self._ros.close()
         self._started = False

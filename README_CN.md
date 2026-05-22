@@ -1,6 +1,6 @@
 # KinopioHub.ROS
 
-KinopioHub.ROS 是一个面向 KinopioHub 协议的 ROS topic 双向桥。它发现 ROS 1 或 ROS 2 topic，把 ROS message 序列化为 JSON envelope 发布到 KinopioHub，也接收匹配的 KinopioHub envelope 写回 ROS。
+KinopioHub.ROS 是一个面向 KinopioHub 协议的 ROS topic 双向桥，也支持显式配置的 ROS service request-reply。它发现 ROS 1 或 ROS 2 topic，把 ROS message 序列化为 JSON envelope 发布到 KinopioHub，接收匹配的 KinopioHub envelope 写回 ROS，并把 allowlist 中的 ROS service 暴露为 NATS request-reply responder。
 
 English version: [README.md](./README.md).
 
@@ -13,9 +13,10 @@ English version: [README.md](./README.md).
 - ROS 2 adapter：Foxy、Humble、Jazzy、Kilted；Rolling 为 best-effort
 - ROS 1 adapter：Noetic
 - 默认 topic 模式：`all`，即桥接当前 ROS graph 中可导入 message type 的 topic
+- Service 调用：只暴露 `services.calls` 中显式声明的 allowlist
 - 运行配置：把 `config.example.yaml` 复制为未跟踪的 `config.yaml`
 
-本项目处理 ROS topic，不处理 service 或 action。
+本项目不处理 action。
 
 ## 快速开始
 
@@ -73,6 +74,13 @@ ros:
 topics:
   mode: all
 
+services:
+  subject_prefix: ros_services
+  calls:
+    - name: /lane_navigation/go_from_to
+      type: lane_navigation/srv/GoFromTo
+      timeout_ms: 30000
+
 sync:
   subject_prefix: ros
   throttle_ms: 100
@@ -82,6 +90,8 @@ sync:
 ```
 
 Topic 选择支持 `all`、`include`、`exclude`。`include` 和 `exclude` 必须提供 ROS topic pattern，例如 `/chatter`、`/robot/*/state`、`/robot/**/text`。
+
+`services.calls` 默认空列表。每个声明的 service 会暴露为 NATS request-reply responder。Service type 可用 ROS 2 风格 `pkg/srv/Name`；ROS 1 运行时会归一化为 `pkg/Name`。
 
 认证模式支持 `none`、`username_password`、`token`、`nkey`、`creds`。密钥值应通过环境变量或未跟踪的私有文件提供。
 
@@ -97,6 +107,14 @@ ROS topic 到 KinopioHub subject 的默认映射规则：去掉开头 `/`，把 
 结构化消息使用 `kinopio.ros.message.v1`，`data` 直接承载 ROS message 的 JSON 对象。`std_msgs/String` 和 `std_msgs/msg/String` 保持旧的 `kinopio.ros.text.v1` envelope，以兼容现有 SDK。写回路径仍接受旧文本 envelope。
 
 每个 envelope 都包含 `topic`、`subject`、ROS version/distro/type、时间戳、`meta.bridgeId` 和 `meta.sequence`。`bridgeId` 与近期写回记录一起用于避免无限回环。
+
+显式配置的 ROS service 使用 `services.subject_prefix` 和同样的 slash-to-dot 规则：
+
+```text
+/lane_navigation/go_from_to -> ros_services.lane_navigation.go_from_to
+```
+
+Service request-reply 使用 `kinopio.ros.service.v1`。NATS client 向映射后的 subject 发送 request，payload 包含 `direction: nats_to_ros`、`service`、`subject`、`ros.version`、`ros.type`、`data`、`meta`；bridge 向 NATS reply subject 返回 `direction: ros_to_nats`、`ok: true` 和响应 `data`，失败时返回 `ok: false`、`error.code`、`error.message`。
 
 ## 开发与验证
 
@@ -144,5 +162,6 @@ python scripts/js_sdk_check.py
 - 运行日志中的 `Connected NATS adapter` 用于确认实际连接的 NATS server。
 - `Ignoring invalid NATS envelope` 表示 payload 不符合 envelope 契约。
 - `Ignoring NATS envelope with mismatched subject/topic` 表示 subject 与 envelope topic 映射不一致。
+- Service request 失败会返回 `kinopio.ros.service.v1`，其中 `ok: false`。
 
 本仓库只提供命令和验证脚本，不安装 systemd service，不修改防火墙，不写入证书库，也不修改 ROS 环境文件。

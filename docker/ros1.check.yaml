@@ -30,6 +30,13 @@ topics:
   patterns:
     - /chatter
 
+services:
+  subject_prefix: ros_services
+  calls:
+    - name: /docker_matrix/set_bool
+      type: std_srvs/srv/SetBool
+      timeout_ms: 10000
+
 sync:
   subject_prefix: ros
   throttle_ms: 0
