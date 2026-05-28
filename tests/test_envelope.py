@@ -125,3 +125,13 @@ def test_decode_envelope_can_rebuild_text_from_json_field():
     assert decoded.json_value == {"pose": {"position": {"x": 1.0}}}
     assert '"pose"' in decoded.text
     assert '"x": 1.0' in decoded.text
+
+
+def test_decode_envelope_accepts_missing_stamp_for_writeback():
+    decoded = decode_envelope(
+        b'{"schema":"kinopio.ros.text.v1","direction":"nats_to_ros","topic":"/inspection_mission/goal_node","subject":"ros.inspection_mission.goal_node","ros":{"version":2,"distro":"foxy","type":"std_msgs/msg/String"},"data":{"text":"node1"},"meta":{"bridgeId":"client","sequence":1}}'
+    )
+
+    assert decoded.text == "node1"
+    assert decoded.stamp.source == "received"
+    assert decoded.topic == "/inspection_mission/goal_node"

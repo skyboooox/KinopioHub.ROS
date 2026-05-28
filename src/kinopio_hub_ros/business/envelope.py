@@ -216,7 +216,7 @@ def envelope_from_dict(data):
     )
 
     ros = _require_mapping(root.get("ros"), "ros")
-    stamp = _require_mapping(root.get("stamp"), "stamp")
+    stamp = _stamp_from_dict(root.get("stamp"))
     meta = _require_mapping(root.get("meta"), "meta")
 
     if schema == ENVELOPE_SCHEMA:
@@ -247,18 +247,26 @@ def envelope_from_dict(data):
             distro=_require_string(ros.get("distro"), "ros.distro"),
             message_type=_require_string(ros.get("type"), "ros.type"),
         ),
-        stamp=Stamp(
-            source=_require_string(stamp.get("source"), "stamp.source"),
-            sec=_require_int(stamp.get("sec"), "stamp.sec", minimum=0),
-            nanosec=_require_int(stamp.get("nanosec"), "stamp.nanosec", minimum=0),
-            iso=_require_string(stamp.get("iso"), "stamp.iso"),
-        ),
+        stamp=stamp,
         text=text,
         json_value=json_value,
         meta=EnvelopeMeta(
             bridge_id=_require_string(meta.get("bridgeId"), "meta.bridgeId"),
             sequence=_require_int(meta.get("sequence"), "meta.sequence", minimum=0),
         ),
+    )
+
+
+def _stamp_from_dict(value):
+    if value is None:
+        return _stamp_from_datetime(datetime.now(timezone.utc), "received")
+
+    stamp = _require_mapping(value, "stamp")
+    return Stamp(
+        source=_require_string(stamp.get("source"), "stamp.source"),
+        sec=_require_int(stamp.get("sec"), "stamp.sec", minimum=0),
+        nanosec=_require_int(stamp.get("nanosec"), "stamp.nanosec", minimum=0),
+        iso=_require_string(stamp.get("iso"), "stamp.iso"),
     )
 
 
