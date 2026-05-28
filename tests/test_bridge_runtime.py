@@ -20,6 +20,7 @@ from kinopio_hub_ros.business.nats_adapter import NatsMessage
 from kinopio_hub_ros.business.ros1_adapter import Ros1Adapter
 from kinopio_hub_ros.business.ros2_adapter import Ros2Adapter
 from kinopio_hub_ros.core.bridge_runtime import BridgeRuntime
+from kinopio_hub_ros.errors import AdapterError
 from tests.fakes import FakeRos1Driver, FakeRos2Driver
 
 
@@ -31,10 +32,19 @@ class FakeNatsSubscription:
         self.unsubscribed = True
 
 
+class FakeNatsStatus:
+    def __init__(self, state, connected_server=None):
+        self.state = state
+        self.connected_server = connected_server
+        self.candidate_servers = ("nats://fake",)
+
+
 class FakeNatsAdapter:
-    def __init__(self, *, fail_connect=False):
+    def __init__(self, *, fail_connect=False, fail_flush_times=0):
         self.connected = False
         self.closed = False
+        self.connect_count = 0
+        self.reconnect_count = 0
         self.flush_count = 0
         self.published = []
         self.subscription_subject = None
@@ -43,18 +53,32 @@ class FakeNatsAdapter:
         self.subscription_callbacks = []
         self.subscription = FakeNatsSubscription()
         self.fail_connect = fail_connect
+        self.fail_flush_times = fail_flush_times
 
     async def connect(self):
+        self.connect_count += 1
         if self.fail_connect:
             raise RuntimeError("connect failed")
         self.connected = True
+        self.closed = False
         return self
 
     async def close(self):
+        self.connected = False
         self.closed = True
+
+    async def reconnect(self):
+        self.reconnect_count += 1
+        await self.close()
+        return await self.connect()
 
     async def flush(self):
         self.flush_count += 1
+        if self.fail_flush_times > 0:
+            self.fail_flush_times -= 1
+            raise AdapterError(
+                "NATS flush failed (tcp): FlushTimeoutError: nats: flush timeout"
+            )
 
     async def publish(self, subject, payload, *, headers=None, reply=None):
         self.published.append(
@@ -72,6 +96,13 @@ class FakeNatsAdapter:
         self.subscription_subjects.append(subject)
         self.subscription_callbacks.append((subject, callback))
         return self.subscription
+
+    def status(self):
+        if self.connected:
+            return FakeNatsStatus("connected", "nats://fake")
+        if self.closed:
+            return FakeNatsStatus("closed")
+        return FakeNatsStatus("disconnected")
 
     async def emit(self, *, subject, payload, reply=""):
         emitted = False
@@ -211,6 +242,54 @@ topics:
     assert envelope.direction == "ros_to_nats"
     assert envelope.topic == "/chatter"
     assert envelope.text == "hello from ros"
+
+
+def test_bridge_keeps_running_after_transient_nats_flush_failure(tmp_path):
+    config = write_config(
+        tmp_path,
+        """
+bridge:
+  id: bridge-test
+sync:
+  subject_prefix: hub.ros
+  throttle_ms: 0
+topics:
+  mode: include
+  patterns:
+    - /chatter
+""".strip()
+        + "\n",
+    )
+    ros_driver = FakeRos2Driver(topics=(("/chatter", ("std_msgs/msg/String",)),))
+    ros_adapter = Ros2Adapter(config, driver=ros_driver)
+    nats_adapter = FakeNatsAdapter(fail_flush_times=1)
+    runtime = BridgeRuntime(
+        config,
+        nats_adapter=nats_adapter,
+        ros_adapter=ros_adapter,
+    )
+
+    async def run():
+        await runtime.start()
+        ros_driver.emit("/chatter", "during outage")
+        await runtime.tick(spin_timeout_sec=0.0)
+
+        ros_driver.emit("/chatter", "after recovery")
+        await runtime.tick(spin_timeout_sec=0.0)
+        await runtime.close()
+
+    asyncio.run(run())
+
+    published_texts = [
+        decode_envelope(published["payload"]).text
+        for published in nats_adapter.published
+    ]
+
+    assert nats_adapter.flush_count == 2
+    assert nats_adapter.connect_count == 2
+    assert nats_adapter.reconnect_count == 1
+    assert nats_adapter.subscription_subjects == ["hub.ros.>", "hub.ros.>"]
+    assert published_texts[-2:] == ["during outage", "after recovery"]
 
 
 def test_bridge_forwards_non_string_ros_topic_to_nats_with_actual_type(tmp_path):
@@ -649,6 +728,44 @@ def test_bridge_replies_to_ros2_service_request(tmp_path):
     assert response.service == SERVICE_NAME
     assert response.ros.version == 2
     assert response.ros.service_type == SERVICE_TYPE
+
+
+def test_bridge_reconnects_after_service_reply_flush_failure(tmp_path):
+    config = service_config(tmp_path, ros_version=2)
+    ros_driver = FakeRos2Driver(
+        services={
+            SERVICE_NAME: {
+                "accepted": True,
+            }
+        }
+    )
+    nats_adapter = FakeNatsAdapter(fail_flush_times=1)
+    runtime = BridgeRuntime(
+        config,
+        nats_adapter=nats_adapter,
+        ros_adapter=Ros2Adapter(config, driver=ros_driver),
+    )
+
+    async def run():
+        await runtime.start()
+        await nats_adapter.emit(
+            subject=SERVICE_SUBJECT,
+            payload=service_request({"goal_node": "node2"}),
+            reply="_INBOX.service",
+        )
+        await asyncio.sleep(0)
+        await runtime.tick(spin_timeout_sec=0.0)
+        await runtime.close()
+
+    asyncio.run(run())
+
+    assert nats_adapter.reconnect_count == 1
+    assert nats_adapter.subscription_subjects == [
+        "ros.>",
+        SERVICE_SUBJECT,
+        "ros.>",
+        SERVICE_SUBJECT,
+    ]
 
 
 def test_bridge_replies_to_ros1_service_request_with_ros1_type(tmp_path):

@@ -110,6 +110,23 @@ class LatestStatePolicy:
     def record_nats_writeback(self, topic, text, now_ms, message_type=None):
         self._recent_writebacks[(topic, message_type, text)] = now_ms + self._loop_suppression_ms
 
+    def requeue_emissions(self, emissions, retry_at_ms):
+        for emission in emissions:
+            if self._latest_published_by_topic.get(emission.topic) == (
+                emission.message_type,
+                emission.text,
+            ):
+                self._latest_published_by_topic.pop(emission.topic, None)
+            self._pending_by_topic[emission.topic] = _PendingText(
+                topic=emission.topic,
+                text=emission.text,
+                message_type=emission.message_type,
+                emit_at_ms=retry_at_ms,
+                first_observed_at_ms=emission.first_observed_at_ms,
+                last_observed_at_ms=emission.last_observed_at_ms,
+                json_value=emission.json_value,
+            )
+
     def latest_seen_text(self, topic):
         return self._latest_seen_by_topic.get(topic)
 

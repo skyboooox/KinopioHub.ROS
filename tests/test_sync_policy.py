@@ -111,3 +111,19 @@ def test_latest_state_and_pending_text_are_tracked():
     assert [emission.text for emission in emissions] == ["ready"]
     assert policy.latest_published_text("/robot/status/text") == "ready"
     assert policy.pending_text("/robot/status/text") is None
+
+
+def test_failed_emission_can_be_requeued_for_retry():
+    policy = LatestStatePolicy(throttle_ms=0, dedupe=True, loop_suppression_ms=1000)
+    emissions = policy.ingest_ros_text(
+        "/chatter",
+        "retry me",
+        now_ms=100,
+        message_type="std_msgs/msg/String",
+    )
+
+    policy.requeue_emissions(emissions, retry_at_ms=200)
+
+    assert policy.latest_published_text("/chatter") is None
+    assert policy.pending_text("/chatter") == "retry me"
+    assert [emission.text for emission in policy.flush_due(now_ms=200)] == ["retry me"]

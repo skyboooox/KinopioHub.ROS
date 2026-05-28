@@ -21,7 +21,7 @@ from kinopio_hub_ros.business.ros_adapter_factory import create_ros_adapter
 from kinopio_hub_ros.business.subject_mapping import topic_to_subject
 from kinopio_hub_ros.core.service_responder import ServiceResponder
 from kinopio_hub_ros.core.sync_policy import LatestStatePolicy
-from kinopio_hub_ros.errors import ProtocolError
+from kinopio_hub_ros.errors import AdapterError, ProtocolError
 
 
 class BridgeRuntime:
@@ -65,9 +65,15 @@ class BridgeRuntime:
             nats_adapter=self._nats,
             next_sequence=self._take_sequence,
             logger=self._logger,
+            on_nats_error=self._mark_nats_reconnect_required,
         )
         self._stop_event = asyncio.Event()
         self._selected_topics = None
+        self._next_nats_publish_error_log_at_ms = 0
+        self._nats_publish_error_log_interval_ms = 10000
+        self._nats_reconnect_required = False
+        self._next_nats_reconnect_at_ms = 0
+        self._nats_reconnect_interval_ms = 1000
 
     async def start(self):
         if self._started:
@@ -99,41 +105,28 @@ class BridgeRuntime:
             else:
                 self._logger.info("Connected NATS adapter")
 
-            if self._should_forward_nats_to_ros():
-                self._nats_subscription = await self._nats.subscribe(
-                    self._subject_wildcard(),
-                    self._nats_events.append,
-                )
-                self._logger.info(
-                    "Subscribed to NATS wildcard %s for writeback envelopes",
-                    self._subject_wildcard(),
-                )
-                await self._service_responder.start()
+            await self._subscribe_nats_consumers()
 
             self._refresh_ros_subscriptions()
             self._started = True
         except Exception:
-            await self._service_responder.close()
-            if self._nats_subscription is not None:
-                await self._nats_subscription.unsubscribe()
-                self._nats_subscription = None
+            await self._close_nats_consumers()
             await self._nats.close()
             self._ros.close()
             raise
 
     async def close(self):
         self._logger.info("Closing bridge runtime bridge_id=%s", self._config.bridge.bridge_id)
-        if self._nats_subscription is not None:
-            await self._nats_subscription.unsubscribe()
-            self._nats_subscription = None
-        await self._service_responder.close()
+        await self._close_nats_consumers()
         await self._nats.close()
         self._ros.close()
         self._started = False
         self._selected_topics = None
+        self._nats_reconnect_required = False
 
     async def tick(self, *, spin_timeout_sec=0.05):
         self._require_started()
+        await self._recover_nats_if_due()
 
         now_ms = self._now_ms()
         if now_ms >= self._next_discovery_at_ms:
@@ -164,6 +157,88 @@ class BridgeRuntime:
                 self._selected_topics = selected_topics
                 self._logger.info("Selected ROS topics: %s", list(selected_topics))
 
+    async def _subscribe_nats_consumers(self):
+        if not self._should_forward_nats_to_ros():
+            return
+        self._nats_subscription = await self._nats.subscribe(
+            self._subject_wildcard(),
+            self._nats_events.append,
+        )
+        self._logger.info(
+            "Subscribed to NATS wildcard %s for writeback envelopes",
+            self._subject_wildcard(),
+        )
+        await self._service_responder.start()
+
+    async def _close_nats_consumers(self):
+        if self._nats_subscription is not None:
+            try:
+                await self._nats_subscription.unsubscribe()
+            except Exception as exc:
+                self._logger.debug(
+                    "Ignoring NATS wildcard subscription cleanup failure: %s",
+                    exc,
+                )
+            self._nats_subscription = None
+        await self._service_responder.close()
+
+    async def _recover_nats_if_due(self):
+        self._mark_nats_reconnect_required_if_closed()
+        if not self._nats_reconnect_required:
+            return
+
+        now_ms = self._now_ms()
+        if now_ms < self._next_nats_reconnect_at_ms:
+            return
+        self._next_nats_reconnect_at_ms = now_ms + self._nats_reconnect_interval_ms
+
+        try:
+            self._logger.info("Attempting NATS reconnect")
+            await self._close_nats_consumers()
+            reconnect = getattr(self._nats, "reconnect", None)
+            if callable(reconnect):
+                await reconnect()
+            else:
+                await self._nats.close()
+                await self._nats.connect()
+            await self._subscribe_nats_consumers()
+        except Exception as exc:
+            self._logger.warning(
+                "NATS reconnect attempt failed; bridge will retry: %s",
+                exc,
+            )
+            return
+
+        self._nats_reconnect_required = False
+        self._next_nats_reconnect_at_ms = 0
+        self._next_nats_publish_error_log_at_ms = 0
+        self._log_nats_connected("Reconnected NATS adapter")
+
+    def _mark_nats_reconnect_required(self):
+        self._nats_reconnect_required = True
+        self._next_nats_reconnect_at_ms = 0
+
+    def _mark_nats_reconnect_required_if_closed(self):
+        nats_status = getattr(self._nats, "status", None)
+        if not callable(nats_status):
+            return
+        status = nats_status()
+        if status.state in ("closed", "disconnected"):
+            self._mark_nats_reconnect_required()
+
+    def _log_nats_connected(self, message):
+        nats_status = getattr(self._nats, "status", None)
+        if callable(nats_status):
+            status = nats_status()
+            self._logger.info(
+                "%s server=%s candidates=%s",
+                message,
+                status.connected_server,
+                list(status.candidate_servers),
+            )
+            return
+        self._logger.info(message)
+
     async def _drain_ros_events(self):
         while self._ros_events:
             message = self._ros_events.popleft()
@@ -181,22 +256,59 @@ class BridgeRuntime:
     async def _flush_due_ros_messages(self):
         if not self._should_forward_ros_to_nats():
             return
+        if self._nats_reconnect_required:
+            return
         await self._publish_emissions(self._policy.flush_due(self._now_ms()))
 
     async def _publish_emissions(self, emissions):
+        emissions = tuple(emissions)
         if not emissions:
             return
-        for emission in emissions:
-            subject = topic_to_subject(emission.topic, self._subject_prefix)
-            envelope = self._build_ros_to_nats_envelope(emission, subject)
-            self._logger.debug(
-                "Forwarding ROS message to NATS topic=%s subject=%s text=%r",
-                emission.topic,
-                subject,
-                emission.text,
+        if self._nats_reconnect_required:
+            self._policy.requeue_emissions(emissions, self._now_ms())
+            return
+        try:
+            for emission in emissions:
+                subject = topic_to_subject(emission.topic, self._subject_prefix)
+                envelope = self._build_ros_to_nats_envelope(emission, subject)
+                self._logger.debug(
+                    "Forwarding ROS message to NATS topic=%s subject=%s text=%r",
+                    emission.topic,
+                    subject,
+                    emission.text,
+                )
+                await self._nats.publish(subject, encode_envelope(envelope))
+            await self._nats.flush()
+            self._next_nats_publish_error_log_at_ms = 0
+        except AdapterError as exc:
+            self._policy.requeue_emissions(emissions, self._now_ms())
+            self._mark_nats_reconnect_required()
+            self._log_nats_publish_failure(exc, emission_count=len(emissions))
+
+    def _log_nats_publish_failure(self, exc, *, emission_count):
+        now_ms = self._now_ms()
+        if now_ms < self._next_nats_publish_error_log_at_ms:
+            return
+        self._next_nats_publish_error_log_at_ms = (
+            now_ms + self._nats_publish_error_log_interval_ms
+        )
+        nats_status = getattr(self._nats, "status", None)
+        status = nats_status() if callable(nats_status) else None
+        if status is None:
+            self._logger.warning(
+                "Unable to publish %s ROS message(s) to NATS; bridge will keep running: %s",
+                emission_count,
+                exc,
             )
-            await self._nats.publish(subject, encode_envelope(envelope))
-        await self._nats.flush()
+            return
+        self._logger.warning(
+            "Unable to publish %s ROS message(s) to NATS; "
+            "bridge will keep running state=%s server=%s error=%s",
+            emission_count,
+            status.state,
+            status.connected_server,
+            exc,
+        )
 
     def _build_ros_to_nats_envelope(self, emission, subject):
         message_type = emission.message_type or self._ros.message_type

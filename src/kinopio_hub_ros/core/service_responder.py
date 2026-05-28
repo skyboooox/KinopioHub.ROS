@@ -14,12 +14,22 @@ from kinopio_hub_ros.errors import AdapterError, ProtocolError, ServiceCallError
 
 
 class ServiceResponder:
-    def __init__(self, config, *, ros_adapter, nats_adapter, next_sequence, logger=None):
+    def __init__(
+        self,
+        config,
+        *,
+        ros_adapter,
+        nats_adapter,
+        next_sequence,
+        logger=None,
+        on_nats_error=None,
+    ):
         self._config = config
         self._ros = ros_adapter
         self._nats = nats_adapter
         self._next_sequence = next_sequence
         self._logger = logger or logging.getLogger(__name__)
+        self._on_nats_error = on_nats_error
         self._subscriptions = []
         self._tasks = set()
         self._calls_by_subject = {}
@@ -39,7 +49,13 @@ class ServiceResponder:
 
     async def close(self):
         for subscription in tuple(self._subscriptions):
-            await subscription.unsubscribe()
+            try:
+                await subscription.unsubscribe()
+            except Exception as exc:
+                self._logger.debug(
+                    "Ignoring service subscription cleanup failure: %s",
+                    exc,
+                )
         self._subscriptions.clear()
         self._calls_by_subject.clear()
         await self._cancel_tasks()
@@ -144,8 +160,17 @@ class ServiceResponder:
         )
 
     async def _reply(self, reply, envelope):
-        await self._nats.publish(reply, encode_service_envelope(envelope))
-        await self._nats.flush()
+        try:
+            await self._nats.publish(reply, encode_service_envelope(envelope))
+            await self._nats.flush()
+        except AdapterError as exc:
+            if self._on_nats_error is not None:
+                self._on_nats_error()
+            self._logger.warning(
+                "Unable to publish ROS service response to NATS; "
+                "bridge will reconnect: %s",
+                exc,
+            )
 
     def _forget_task(self, task):
         self._tasks.discard(task)

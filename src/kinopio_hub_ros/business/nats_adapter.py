@@ -136,6 +136,8 @@ class NatsAdapter:
     async def connect(self):
         if self._nc is not None and getattr(self._nc, "is_connected", False):
             return self
+        if self._nc is not None:
+            await self.close()
 
         if not self._probe_results:
             await self.probe_servers()
@@ -167,17 +169,15 @@ class NatsAdapter:
                     ordered_servers,
                     **self._connect_kwargs(
                         callbacks=callbacks,
-                        allow_reconnect=False,
-                        reconnect_time_wait=0.0,
-                        max_reconnect_attempts=1,
+                        allow_reconnect=self._auto_retry,
                     ),
                 ),
                 timeout=self._initial_connect_timeout(len(ordered_servers)),
             )
-            self._enable_runtime_reconnect(self._nc)
             await self.flush()
         except Exception as exc:
-            self._remember_error(exc)
+            if not isinstance(exc, AdapterError):
+                self._remember_error(exc)
             await self._force_close_client(self._nc)
             self._nc = None
             raise AdapterError(
@@ -195,18 +195,33 @@ class NatsAdapter:
         self._nc = None
         self._subscriptions.clear()
 
+    async def reconnect(self):
+        await self.close()
+        self._probe_results = ()
+        return await self.connect()
+
     async def flush(self):
-        nc = self._require_client()
-        await nc.flush(timeout=self._flush_timeout)
+        try:
+            nc = self._require_client()
+            await nc.flush(timeout=self._flush_timeout)
+        except AdapterError:
+            raise
+        except Exception as exc:
+            raise self._adapter_error("flush", exc) from exc
 
     async def publish(self, subject, payload, *, headers=None, reply=None):
-        nc = self._require_client()
-        await nc.publish(
-            subject,
-            payload,
-            reply=reply or "",
-            headers=dict(headers) if headers else None,
-        )
+        try:
+            nc = self._require_client()
+            await nc.publish(
+                subject,
+                payload,
+                reply=reply or "",
+                headers=dict(headers) if headers else None,
+            )
+        except AdapterError:
+            raise
+        except Exception as exc:
+            raise self._adapter_error("publish", exc) from exc
 
     async def subscribe(self, subject, callback, *, queue=None, max_messages=None):
         nc = self._require_client()
@@ -223,13 +238,16 @@ class NatsAdapter:
             if inspect.isawaitable(result):
                 await result
 
-        subscription = await nc.subscribe(
-            subject,
-            queue=queue or "",
-            cb=wrapped,
-            max_msgs=max_messages or 0,
-        )
-        await nc.flush(timeout=self._flush_timeout)
+        try:
+            subscription = await nc.subscribe(
+                subject,
+                queue=queue or "",
+                cb=wrapped,
+                max_msgs=max_messages or 0,
+            )
+            await nc.flush(timeout=self._flush_timeout)
+        except Exception as exc:
+            raise self._adapter_error("subscribe", exc) from exc
         handle = SubscriptionHandle(subject, subscription)
         self._subscriptions.add(handle)
         return handle
@@ -445,6 +463,16 @@ class NatsAdapter:
         self._last_error = exc
         self._last_error_category, _ = classify_nats_exception(exc)
 
+    def _adapter_error(self, operation, exc):
+        self._remember_error(exc)
+        return AdapterError(
+            "NATS {0} failed ({1}): {2}".format(
+                operation,
+                self._last_error_category or PROBE_ERROR_CATEGORY_UNKNOWN,
+                self._last_error_message(),
+            )
+        )
+
     def _last_error_message(self):
         if self._last_error is None:
             return None
@@ -452,7 +480,9 @@ class NatsAdapter:
 
     def _require_client(self):
         if self._nc is None or not getattr(self._nc, "is_connected", False):
-            raise AdapterError("NATS connection is not available")
+            exc = AdapterError("NATS connection is not available")
+            self._remember_error(exc)
+            raise exc
         return self._nc
 
     async def _force_close_client(self, client):
@@ -464,15 +494,6 @@ class NatsAdapter:
                 await close()
             except Exception:
                 pass
-
-    def _enable_runtime_reconnect(self, client):
-        if client is None or not self._auto_retry:
-            return
-        options = getattr(client, "options", None)
-        if isinstance(options, dict):
-            options["allow_reconnect"] = True
-            options["reconnect_time_wait"] = self._reconnect_time_wait
-            options["max_reconnect_attempts"] = self._max_reconnect_attempts
 
     def _resolve_connected_server(self, client):
         if client is None:
@@ -582,7 +603,12 @@ def classify_nats_exception(exc):
         return PROBE_ERROR_CATEGORY_PROTOCOL, text
     if "name or service not known" in lowered or "nodename nor servname provided" in lowered:
         return PROBE_ERROR_CATEGORY_DNS, text
-    if "refused" in lowered or "timed out" in lowered or "unreachable" in lowered:
+    if (
+        "refused" in lowered
+        or "timed out" in lowered
+        or "timeout" in lowered
+        or "unreachable" in lowered
+    ):
         return PROBE_ERROR_CATEGORY_TCP, text
     return PROBE_ERROR_CATEGORY_UNKNOWN, text
 

@@ -18,12 +18,29 @@ from kinopio_hub_ros.business.nats_adapter import (
     PROBE_ERROR_CATEGORY_TLS,
     classify_nats_exception,
 )
+from kinopio_hub_ros.errors import AdapterError
 
 
 def shutil_which(name):
     import shutil
 
     return shutil.which(name)
+
+
+def docker_daemon_available():
+    if shutil_which("docker") is None:
+        return False
+    try:
+        result = subprocess.run(
+            ["docker", "info"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
 
 
 class _FakeConnectedUrl:
@@ -37,6 +54,7 @@ class _FakeConnectedUrl:
 class _FakeClient:
     connect_kwargs_seen = []
     server_outcomes = {}
+    flush_exception = None
 
     def __init__(self):
         self.options = {}
@@ -58,6 +76,8 @@ class _FakeClient:
         self.connected_url = _FakeConnectedUrl(server)
 
     async def flush(self, timeout=None):
+        if _FakeClient.flush_exception is not None:
+            raise _FakeClient.flush_exception
         return None
 
     async def close(self):
@@ -123,6 +143,7 @@ topics:
     )
     config = load_config(path)
     _FakeClient.connect_kwargs_seen = []
+    _FakeClient.flush_exception = None
     _FakeClient.server_outcomes = {
         "tls://bad.example:14222": {"exception": ConnectionRefusedError("refused")},
         "tls://good.example:14222": {},
@@ -158,6 +179,7 @@ topics:
     )
     config = load_config(path)
     _FakeClient.connect_kwargs_seen = []
+    _FakeClient.flush_exception = None
     _FakeClient.server_outcomes = {server: {} for server in DEFAULT_NATS_SERVERS}
 
     adapter = NatsAdapter(config, client_factory=_FakeClient)
@@ -165,12 +187,12 @@ topics:
 
     connect_kwargs = _FakeClient.connect_kwargs_seen[-1]
 
-    assert connect_kwargs["allow_reconnect"] is False
+    assert connect_kwargs["allow_reconnect"] is True
     assert connect_kwargs["no_echo"] is True
     assert connect_kwargs["tls_handshake_first"] is True
     assert connect_kwargs["tls_hostname"] == "localhost"
     assert isinstance(connect_kwargs["tls"], ssl.SSLContext)
-    assert adapter._nc.options["allow_reconnect"] is True
+    assert connect_kwargs["max_reconnect_attempts"] == -1
 
 
 def test_connect_raises_after_probe_failures(tmp_path):
@@ -189,6 +211,7 @@ topics:
     )
     config = load_config(path)
     _FakeClient.connect_kwargs_seen = []
+    _FakeClient.flush_exception = None
     _FakeClient.server_outcomes = {
         "tls://bad-a.example:14222": {"exception": TimeoutError("timed out")},
         "tls://bad-b.example:14222": {"exception": ConnectionRefusedError("refused")},
@@ -202,6 +225,39 @@ topics:
     message = str(exc_info.value)
     assert "no reachable NATS servers" in message
     assert "timed out" in message or "refused" in message
+
+
+def test_flush_timeout_is_wrapped_as_adapter_error_and_status_is_updated(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+topics:
+  mode: all
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    config = load_config(path)
+    _FakeClient.connect_kwargs_seen = []
+    _FakeClient.flush_exception = None
+    _FakeClient.server_outcomes = {server: {} for server in DEFAULT_NATS_SERVERS}
+    adapter = NatsAdapter(config, client_factory=_FakeClient)
+
+    async def run():
+        await adapter.connect()
+        _FakeClient.flush_exception = TimeoutError("nats: flush timeout")
+        try:
+            with pytest.raises(AdapterError, match="NATS flush failed"):
+                await adapter.flush()
+            return adapter.status()
+        finally:
+            _FakeClient.flush_exception = None
+            await adapter.close()
+
+    status = asyncio.run(run())
+
+    assert status.last_error_category == PROBE_ERROR_CATEGORY_TCP
+    assert "flush timeout" in status.last_error_message
 
 
 def test_error_classifier_distinguishes_major_categories():
@@ -218,7 +274,7 @@ def test_error_classifier_distinguishes_major_categories():
     assert classify_nats_exception(ValueError("protocol parser exploded"))[0] == PROBE_ERROR_CATEGORY_PROTOCOL
 
 
-@pytest.mark.skipif(shutil_which("docker") is None, reason="docker is not available")
+@pytest.mark.skipif(not docker_daemon_available(), reason="docker daemon is not available")
 def test_adapter_can_publish_and_subscribe_against_local_tls_nats(tmp_path):
     async def run():
         work_dir = Path(tempfile.mkdtemp(prefix="kinopio-hub-ros-nats."))
